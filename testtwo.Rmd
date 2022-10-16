@@ -1,0 +1,560 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+library(tidyverse)
+library(kernlab)
+library(dbscan)
+library(clValid)
+library(factoextra)
+library(uwot)
+library(patchwork)
+library(dplyr)
+library(tidytext)
+#library(stringer)
+library(rscopus)
+library(pdftools)
+library(tm)
+library(quanteda)
+library(textstem)
+library(gutenbergr)
+library(wordcloud)
+library(lsa)
+library(stm)
+library(text2vec)
+library(rPref)
+library(DT)
+library(textdata)
+library(knitr)
+library(ggrepel)
+library(caret)
+set.seed(888)
+rm(list = ls())
+options(ggrepel.max.overlaps = Inf)
+
+```
+
+# Data reading and initial cleaning
+```{r}
+
+dat <- read.csv("~/ISYE 602/testthree.csv")
+colnames(dat) = make.names(colnames(dat), unique = TRUE)
+
+dat$Keywords[dat$Keywords == ""] <- NA
+
+newdat <- na.omit(dat)
+
+text_df <- tibble(line = 1:1694, text = newdat$Keywords)
+
+text_df %>%
+ unnest_tokens(word,text)
+
+original <- newdat %>%
+  group_by(Professor) %>%
+  mutate(linenumber = row_number()) %>%
+  ungroup()
+
+tidyoriginal <- original %>%
+  unnest_tokens(word, Keywords) ## Tidyoriginal contains professor names in one column with their respective keywords as individual rows in another column. The 'line number' column represents which research paper those keywords were from for that professor. 
+
+```
+
+# Further cleaning on text data
+The following plot reveals each professor's name with the number of keywords included in the data from their publications. 
+```{r tokenize_text}
+
+## Numbers
+tidyoriginal$word = gsub('[0-9]+', '', tidyoriginal$word)
+
+## Periods
+tidyoriginal$word = gsub('[.]+', '', tidyoriginal$word)
+
+## Non-words
+tidyoriginal$word = gsub('doi', '', tidyoriginal$word)
+tidyoriginal$word = gsub('fig', '', tidyoriginal$word)
+
+## Tokenize
+researchtext.df = tidyoriginal %>% 
+unnest_tokens(term, word, token = "words", 
+                to_lower = TRUE, 
+                strip_punct = TRUE) 
+
+## One or two letters
+researchtext.df = researchtext.df %>% filter(str_length(term)>2)
+
+## Too many letters
+researchtext.df = researchtext.df %>% filter(str_length(term)<15)
+
+researchtext.df = researchtext.df %>% 
+  anti_join(get_stopwords(), by = c("term" = "word"))
+
+## Lemmatize
+researchtext.df$term = lemmatize_words(researchtext.df$term)
+
+researchtext.df %>% count(Professor) %>% 
+ggplot(aes(n, reorder(Professor, -n))) +
+  geom_col()+
+ labs(x = "Total words in keywords", y = "")
+
+```
+
+Created additional data frame with all words grouped by professor for later use.
+```{r}
+
+groupedwords <- tidyoriginal %>%
+  select(Professor, word) %>%
+  group_by(Professor) %>%
+  mutate(allwords = paste(word, collapse = " , "))
+
+groupedwords <- tidyoriginal %>%
+  group_by(Professor) %>%
+  summarize(allwords = paste(word, collapse = " , "))
+
+```
+
+
+# Initial visualization of words via TF and IDF values
+Word cloud, top words for each professor, and top words overall
+```{r tf_idf, fig.height=4.5, warning=FALSE}
+
+## Term frequency and tf_idf variables
+researchtfidf.text.df = researchtext.df %>% count(Professor, term) %>% 
+  bind_tf_idf(term, Professor, n)
+
+## Infrequent words
+researchtfidf.text.df = researchtfidf.text.df %>% filter(n>8)
+
+## Indiscriminate words
+researchtfidf.text.df = researchtfidf.text.df %>% filter(tf_idf>.000001)
+
+## Wordcloud
+wordcloud(researchtfidf.text.df$term, researchtfidf.text.df$n, min.freq = 5)
+
+## Most discriminating terms
+researchtop10.df = researchtfidf.text.df %>% group_by(Professor) %>% top_n(10, tf_idf) %>% 
+  ungroup() %>% 
+  mutate(Professor = as.factor(Professor))
+
+ggplot(researchtop10.df, aes(reorder_within(term, tf_idf, within = Professor), tf_idf)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(.~Professor, scales = "free")+
+  scale_x_reordered() 
+
+## Scatterplot
+ggplot(researchtop10.df, aes(idf, tf, size = tf_idf)) +
+  geom_point(shape = 21, size = .75) +
+  geom_text_repel(aes(label = term, size = tf_idf)) +
+  facet_wrap(.~Professor) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+## Top tf_idf plot
+ggplot(researchtop10.df, aes(idf, tf, size = tf_idf)) +
+  geom_point(shape = 21, size = 1) +
+  geom_text_repel(aes(label = term, size = tf_idf)) +
+  theme_bw() +
+  coord_trans(y="log") +
+  theme(legend.position = "none")
+
+rm(researchtop10.df)
+
+``` 
+
+# Latent semantic analysis
+```{r lsa}
+
+# Convert
+researchtdm_weighted.tdmat = cast_tdm(researchtfidf.text.df, term, Professor, tf_idf)
+researchtdm_count.tdmat = cast_tdm(researchtfidf.text.df, term, Professor, n)
+
+
+## LSA
+researchlsa_model <- lsa(researchtdm_count.tdmat,  dims=dimcalc_share(share = 0.75)) 
+
+## Dimensions
+dim(researchlsa_model$tk)
+dim(researchlsa_model$dk)
+length(researchlsa_model$sk)
+
+## Expected value
+as.textmatrix(researchlsa_model)
+
+researchlsa_model <- lsa(researchtdm_weighted.tdmat,  dims=dimcalc_share(share = 0.75)) 
+
+rm(researchtdm_count.tdmat)
+
+```
+
+# Dendrograms
+The dendrogram of professors put most of the human factors researchers into the same cluster - pretty cool! 
+```{r lsa_clustering, fig.height=6}
+
+research.similiarity.mat = cosine(t(researchlsa_model$dk))
+
+researchtemp = researchtfidf.text.df %>% 
+  group_by(term) %>% 
+  summarise(m.tf_idf = mean(tf_idf)) %>% 
+  cbind(researchlsa_model$tk) %>% top_n(70, m.tf_idf) 
+
+row.names(researchtemp)= researchtemp$term
+researchterm.similiarity.mat = cosine(t(researchtemp %>% select(-term, -m.tf_idf))) 
+
+research.dissimilarity.dist = as.dist(1-research.similiarity.mat)
+researchterm.dissimilarity.dist = as.dist(1-researchterm.similiarity.mat)
+
+researchdoc.cluster = hclust(research.dissimilarity.dist, method = "ward.D2", members = NULL)
+plot(researchdoc.cluster)
+
+researchterm.cluster = hclust(researchterm.dissimilarity.dist, method = "ward.D2", members = NULL)
+plot(researchterm.cluster)
+
+rm(researchtemp)
+
+```
+
+# UMAP Clusters
+```{r}
+
+researchterm.umap = umap(researchlsa_model$tk, n_neighbors = 20, n_components = 2) %>% 
+  as.tibble()
+
+names(researchterm.umap) = c("umap_1", "umap_2")
+
+researchterm.umap = researchtfidf.text.df %>% group_by(term) %>% 
+  summarise(m.tf_idf = max(tf_idf)) %>%
+  cbind(researchterm.umap) 
+
+researchterm.umap.plot = 
+  ggplot(researchterm.umap, aes(umap_1, umap_2)) +
+  geom_point(aes(size=m.tf_idf),shape = 21) +
+  geom_label_repel(data = researchterm.umap %>% top_n(175, m.tf_idf),
+                   aes(label = term), alpha = .6, size = 3) +
+  labs(title = "UMAP clustering", subtitle = "20 nearest neighbors") +
+  theme_void()+
+  theme(legend.position = "none")
+researchterm.umap.plot
+
+researchdoc.umap = 
+  umap(researchlsa_model$dk, n_neighbors = 3, n_components = 2) %>% 
+  as.tibble()
+names(researchdoc.umap) = c("umap_1", "umap_2")
+researchdoc.umap = cbind(groupedwords, researchdoc.umap) # next is to compare this with other text analysis exercise
+
+researchdoc.umap.plot = 
+  ggplot(researchdoc.umap, aes(umap_1, umap_2)) +
+  geom_point(aes(colour = Professor), size = 2.5) +
+  geom_label_repel(aes(label = Professor), alpha = .6, size = 3) +
+  labs(title = "UMAP clustering", subtitle = "3 nearest neighbors") +
+  theme(legend.position = "none")
+researchdoc.umap.plot
+
+rm(researchterm.umap, researchterm.cluster, researchdoc.umap.plot, researchdoc.umap)
+
+```
+
+# Topic model analysis
+```{r identify_topics, message=FALSE}
+
+researchtext.sparse = researchtfidf.text.df %>% cast_sparse(Professor, term, n)
+
+researchmulti_stm.fit = searchK(researchtext.sparse, 
+                      K= c(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13), 
+                      M = 12,
+                      init.type = "Spectral",
+                      N = 4,
+                      proportion = 0.5, 
+                      heldout.seed = 888)
+
+plot(researchmulti_stm.fit)
+
+# Mimno, D., Wallach, H. M., Talley, E., & Leenders, M. (2011). Optimizing Semantic Coherence in Topic Models, (2), 262–272.
+
+researchmultifit.results = researchmulti_stm.fit$results %>% unnest()
+
+researchsky <- psel(researchmultifit.results, high(semcoh) * high(exclus))
+researchCoherenceExclusivity.plot = ggplot(researchmultifit.results, aes(semcoh, exclus))+
+  geom_point()+
+  geom_text_repel(aes(label = K)) +
+  geom_step(data = researchsky, direction = "hv") +
+  labs(y = "Exclusivity", x = "Coherence")
+researchCoherenceExclusivity.plot
+
+researchsky <- psel(researchmultifit.results, high(heldout) * high(bound))
+researchLikelihoodBound.plot = ggplot(researchmultifit.results, aes(heldout, bound))+
+  geom_point() +
+  geom_text_repel(aes(label = K)) +
+  geom_step(data = researchsky, direction = "hv") +
+  labs(y = "Heldout likelihood", x = "Lower bound of marginal likelihood")
+researchLikelihoodBound.plot
+
+rm(researchLikelihoodBound.plot, researchmultifit.results, researchCoherenceExclusivity.plot, researchsky)
+
+```
+
+# Proportions and FREX values
+Not sure why this one is not letting group by professors.
+```{r final_topicmodel, fig.height=4.5, message=FALSE}
+
+researchtext.sparse = researchtfidf.text.df %>% cast_sparse(Professor, term, n)
+
+researchtopic_model = stm(researchtext.sparse, K = 9, 
+                   control = list(eta = .01, alpha = 50/8), 
+                  verbose = FALSE, init.type = "Spectral")
+
+researchtd_beta = tidy(researchtopic_model) 
+
+researchtd_beta =
+   researchtd_beta %>%
+    group_by(topic) %>%
+    top_n(10, beta) %>%
+    ungroup()
+
+researchfrex = labelTopics(researchtopic_model, n = 4)$frex %>% as.tibble() %>% unite(col = topic_name) 
+researchfrex = cbind(topic = labelTopics(researchtopic_model, n = 3)$topicnums, researchfrex)
+researchfrex$topic_number_name = paste(researchfrex$topic, researchfrex$topic_name, sep = "-") 
+researchtd_beta = left_join(researchtd_beta, researchfrex)
+
+researchtd_beta_ordered = researchtd_beta %>% 
+  mutate(term_ordered = reorder_within(term , beta, topic))
+
+ggplot(researchtd_beta_ordered, aes(term_ordered, beta)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(.~topic_number_name, scales = "free")+
+  labs(title = "Prevalence of terms across topics", 
+         x = "term", y = "Term prevalence (beta)") +
+  scale_x_reordered() 
+
+researchtd_gamma =
+    tidy(researchtopic_model, matrix = "gamma",
+         professor_names = rownames(researchtext.sparse))
+
+researchtd_gamma = 
+    researchtd_gamma %>% group_by(document) %>%
+    mutate(dominant_topic = which.max(gamma))
+
+researchtopic_names = researchtd_beta %>% select(topic, topic_number_name) %>% distinct()
+researchtd_gamma = left_join(researchtd_gamma, researchtopic_names , by = "topic")
+  
+ggplot(researchtd_gamma, aes(as.factor(topic), gamma, fill = as.factor(topic_number_name))) +
+    geom_col(width = .8, position = position_dodge(width = .2, preserve = "single")) +
+    facet_grid(reorder(interaction(dominant_topic, document), dominant_topic)~.,
+               scales = "free_x", drop = TRUE) +
+    labs(title = "Prevalence of topics across professors", subtitle = "Most professors have one topic",
+         x = "Topic", y = "Topic prevalence (gamma)") +
+    theme(legend.position = "bottom", 
+            axis.text.y = element_blank(),
+            axis.ticks = element_blank(),
+             strip.text.y = element_text(angle =0, hjust = 0))
+
+# rm(researchtd_beta, researchtd_gamma, researchfrex, researchtopic_names)
+
+```
+
+# Sentiment analysis
+```{r sentiment_terms}
+
+get_sentiments("afinn") %>% datatable()
+get_sentiments("bing") %>% datatable()
+get_sentiments("nrc")[1:1000, ] %>% datatable()
+
+```
+
+```{r paper_sentiment}
+
+researchsentiment.df = researchtext.df %>% group_by(Professor) %>% 
+  mutate(total_terms = n()) %>% ungroup() %>% 
+  inner_join(get_sentiments("bing"), by=c("term" = "word")) %>%
+  group_by(Professor, sentiment) %>% 
+  summarise(n = n(), total_terms= first(total_terms)) %>% 
+  ungroup() %>% group_by(Professor) %>% 
+  mutate(proportion = n/total_terms) %>% group_by(Professor, sentiment) %>% 
+  mutate(signed.proportion = replace(proportion, sentiment=="negative", -proportion)) %>% 
+  ungroup() %>% 
+  group_by(Professor) %>% 
+  mutate(sum_sentiment = sum(signed.proportion))
+
+ggplot(researchsentiment.df, 
+       aes(reorder(Professor, sum_sentiment), signed.proportion, fill = sentiment))+
+  geom_col() +
+  coord_flip() +
+  labs(x = "Professors ordered by net proportion of positive sentiment", 
+       y = "Proportion of positive and negative words") +
+  theme(legend.position = "none")
+
+```
+
+```{r sentiment_influencers}
+
+researchinfluence_sentiment.df = researchtext.df %>% 
+  inner_join(get_sentiments("bing"), by=c("term" = "word")) %>% 
+  count(Professor, sentiment, term) %>% 
+  group_by(Professor, sentiment) %>% 
+  top_n(n, n = 5) %>% slice(1:5) %>% # Limits to 5 in case of ties
+  mutate(signed.sentiment = replace(n, sentiment=="negative", -n))  
+  
+ggplot(researchinfluence_sentiment.df, aes(reorder_within(term, n, Professor), signed.sentiment, fill = sentiment)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(.~Professor, scales = "free")+
+  scale_x_reordered() +
+  labs(x= "Words that strongly contribute to professor sentiment", y = "Positive and negative sentiment") +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+
+researchsentiment.df.afinn = researchtext.df %>% group_by(Professor) %>% 
+  mutate(total_terms = n()) %>% ungroup() %>% 
+  inner_join(get_sentiments("afinn"), by=c("term" = "word")) %>% 
+rename(sentiment = value) %>%
+  group_by(Professor, sentiment) %>% 
+  summarise(n = n(), total_terms= first(total_terms)) %>%
+  ungroup() %>% group_by(Professor) %>%
+  mutate(proportion = n/total_terms) %>% group_by(Professor, sentiment) %>%
+  mutate(signed.proportion = replace(proportion, sentiment <0, -proportion)) %>%
+  ungroup() %>%
+  group_by(Professor) %>%
+  mutate(sum_sentiment = sum(signed.proportion))
+
+ggplot(researchsentiment.df.afinn, 
+       aes(reorder(Professor, sum_sentiment), signed.proportion, fill = sentiment))+
+  geom_col() +
+  coord_flip() +
+  labs(x = "Professors ordered by net proportion of positive sentiment", 
+       y = "Proportion of positive and negative words") +
+  theme(legend.position = "none")
+
+```
+
+# Glove embedding
+```{r}
+## Embeddings downloaded from: https://nlp.stanford.edu/projects/glove/
+
+glove = read_delim(file = "/Users/madel/Documents/ISYE 602/ExFive/glove.6B.100d.txt", 
+                   progress =FALSE,
+                   col_names = FALSE, delim = " ", quote = "")
+names(glove)[1] = "token"
+
+```
+
+
+```{r, message=FALSE, fig.height=6}
+
+researchglovec.text.df = researchtext.df %>% 
+  inner_join(glove, by=c("term" = "token"))
+
+researchs.glovec.text.df = researchglovec.text.df %>% 
+  gather(key = glovec_id, value = glovalue, contains("X")) %>% 
+  group_by(Professor, glovec_id) %>% 
+  summarise(m.glovalue = mean(glovalue)) %>% 
+  spread(key = glovec_id, value = m.glovalue) %>% 
+  ungroup()
+
+researchdoc.similiarity.mat = cosine(t(researchs.glovec.text.df %>% select(contains("X")) %>% as.matrix()))  
+row.names(research.similiarity.mat) = as.vector(researchs.glovec.text.df$Professor)
+  
+research.dissimilarity.dist = as.dist(1-research.similiarity.mat)
+
+researchdoc.cluster = hclust(research.dissimilarity.dist, method = "ward.D2", members = NULL)
+plot(researchdoc.cluster)
+
+```
+
+```{r}
+
+ research.umap = researchs.glovec.text.df %>% select(starts_with("X")) %>% 
+   umap(n_neighbors = 3, n_components = 2) %>% 
+   as.tibble()
+ names(research.umap) = c("umap_1", "umap_2")
+ research.umap = cbind(groupedwords, research.umap)
+
+research.umap.plot = 
+  ggplot(research.umap, aes(umap_1, umap_2)) +
+  geom_point(aes(colour = Professor), size = 2.5) +
+  geom_label_repel(aes(label = Professor), alpha = .6, size = 3) +
+  labs(title = "UMAP clustering", subtitle = "3 nearest neighbors") +
+  theme_void()+
+  theme(legend.position = "none")
+research.umap.plot
+
+```
+
+```{r}
+
+researchterms.df = researchtfidf.text.df %>% group_by(term) %>% 
+  summarise(m.tf_idf = max(tf_idf)) %>% 
+  inner_join(glove, by=c("term" = "token"))
+
+researchterm.umap = researchterms.df %>% select(starts_with("X")) %>% 
+  umap(n_neighbors = 10, n_components = 2) %>% 
+  as.tibble()
+names(researchterm.umap) = c("umap_1", "umap_2")
+
+researchterm.umap =  researchterms.df %>%
+  cbind(researchterm.umap) 
+
+researchterm.umap.plot = 
+  ggplot(researchterm.umap, aes(umap_1, umap_2)) +
+  geom_point(aes(size=m.tf_idf),shape = 21) +
+  geom_label_repel(data = researchterm.umap %>% top_n(100, m.tf_idf),
+                   aes(label = term), alpha = .6, size = 3) +
+  labs(title = "UMAP clustering", subtitle = "20 nearest neighbors") +
+  theme_void()+
+  theme(legend.position = "none")
+researchterm.umap.plot
+
+```
+
+# Canonical correlation
+```{r, fig.height=4.5}
+
+researchcombined.embedding = cbind(researchs.glovec.text.df, researchlsa_model$dk)
+
+researchglovector = researchs.glovec.text.df %>% select(contains("X")) %>% as.matrix
+
+researchcombined.embedding.kcca = kcca(researchlsa_model$dk, researchglovector,
+     kernel="rbfdot", kpar=list(sigma=0.1),
+     gamma = 0.1, ncomps = 30)
+
+researchcombined.embedding.kcca.mat = cbind(researchcombined.embedding.kcca@xcoef, researchcombined.embedding.kcca@xcoef)
+
+research.similiarity.mat = cosine(t(researchcombined.embedding.kcca.mat))  
+row.names(research.similiarity.mat) = as.vector(researchs.glovec.text.df$Professor)
+  
+research.dissimilarity.dist = as.dist(1-research.similiarity.mat)
+
+research.cluster = hclust(research.dissimilarity.dist, method = "ward.D2", members = NULL)
+plot(research.cluster)
+
+```
+
+
+
+
+
+
+
+# Attempt at utilizing scopus package (ignore for now)
+Having issues trying to set up API key - could try creating my own API through the website when logged in but not sure if that is needed
+```{r}
+
+#get_author_info(last_name = "Lee", first_name = "John",
+ # affil_id = NULL, affil_name = "University of Wisconsin-Madison")
+
+
+#omplete_author_info(last_name = NULL, first_name = NULL,
+ # affil_id = NULL, affil_name = NULL, api_key = NULL,
+#  http = "https://api.elsevier.com/content/search/author",
+#  query = NULL, count = 200, start = 0, verbose = TRUE,
+#  au_id = NULL, headers = NULL, ...)
+
+```
+
